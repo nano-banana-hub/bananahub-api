@@ -9,6 +9,7 @@
  *   count:{repo}:{template_id}        per-template total   (no TTL)
  *   repo-count:{repo}                 repo-level aggregate (no TTL)
  *   daily:{YYYY-MM-DD}:{repo}:{template_id}   trending    (TTL 7d)
+ *   discovered:{repo}:{template_id}   discovered candidate metadata (no TTL)
  *   ratelimit:{ip}:{minute}           rate-limit counter   (TTL 120s)
  */
 
@@ -38,6 +39,57 @@ function minuteKey() {
 /** Return today's UTC date string (YYYY-MM-DD). */
 function todayUTC() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function clampLimit(rawValue, fallback = 100, max = 1000) {
+  let limit = parseInt(rawValue || String(fallback), 10);
+  if (Number.isNaN(limit) || limit < 1) {
+    limit = fallback;
+  }
+  return Math.min(limit, max);
+}
+
+function normalizeOptionalString(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim().replace(/^\/+|\/+$/g, "");
+}
+
+async function upsertDiscoveredCandidate(env, body, repo, templateId) {
+  const key = `discovered:${repo}:${templateId}`;
+  const now = new Date().toISOString();
+
+  let existing = null;
+  try {
+    const raw = await env.INSTALLS.get(key);
+    existing = raw ? JSON.parse(raw) : null;
+  } catch {
+    existing = null;
+  }
+
+  const templatePath = normalizeOptionalString(body.template_path);
+  const installTarget = typeof body.install_target === "string" ? body.install_target.trim() : "";
+  const cliVersion = typeof body.cli_version === "string" ? body.cli_version.trim() : "";
+
+  const candidate = {
+    repo,
+    template_id: templateId,
+    template_path: templatePath || existing?.template_path || "",
+    install_target: installTarget || existing?.install_target || "",
+    first_seen_at: existing?.first_seen_at || now,
+    last_seen_at: now,
+    install_events: (existing?.install_events || 0) + 1,
+  };
+
+  if (cliVersion) {
+    candidate.latest_cli_version = cliVersion;
+  } else if (existing?.latest_cli_version) {
+    candidate.latest_cli_version = existing.latest_cli_version;
+  }
+
+  await env.INSTALLS.put(key, JSON.stringify(candidate));
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +154,7 @@ async function handleInstalls(request, env) {
     env.INSTALLS.put(countKey, String(newCount)),
     env.INSTALLS.put(repoKey, String(newRepoCount)),
     env.INSTALLS.put(dailyKey, String(newDaily), { expirationTtl: 604800 }), // 7 days
+    upsertDiscoveredCandidate(env, body, repo, template_id),
   ]);
 
   return json({ ok: true });
@@ -143,9 +196,7 @@ async function handleStats(url, env) {
  */
 async function handleTrending(url, env) {
   const period = url.searchParams.get("period") || "24h";
-  let limit = parseInt(url.searchParams.get("limit") || "20", 10);
-  if (isNaN(limit) || limit < 1) limit = 20;
-  if (limit > 100) limit = 100;
+  const limit = clampLimit(url.searchParams.get("limit"), 20, 100);
 
   // Determine which dates to include
   const today = todayUTC();
@@ -241,6 +292,66 @@ async function handleTrending(url, env) {
   return json({ period, templates: sorted });
 }
 
+/**
+ * GET /api/discovered?limit=200
+ *
+ * Return discovered template candidates inferred from install events.
+ */
+async function handleDiscovered(url, env) {
+  const limit = clampLimit(url.searchParams.get("limit"), 200, 1000);
+  const candidates = [];
+
+  let cursor = undefined;
+  let done = false;
+
+  while (!done) {
+    const listOpts = { prefix: "discovered:", limit: 1000 };
+    if (cursor) listOpts.cursor = cursor;
+
+    const result = await env.INSTALLS.list(listOpts);
+
+    const batchValues = await Promise.all(
+      result.keys.map((key) =>
+        env.INSTALLS.get(key.name).catch(() => null)
+      )
+    );
+
+    for (const rawValue of batchValues) {
+      if (!rawValue) continue;
+
+      try {
+        const parsed = JSON.parse(rawValue);
+        if (!parsed?.repo || !parsed?.template_id) {
+          continue;
+        }
+        candidates.push(parsed);
+      } catch {
+        // Ignore malformed discovered entries.
+      }
+    }
+
+    if (result.list_complete) {
+      done = true;
+    } else {
+      cursor = result.cursor;
+    }
+  }
+
+  candidates.sort((left, right) => {
+    const installsDiff = (right.install_events || 0) - (left.install_events || 0);
+    if (installsDiff !== 0) {
+      return installsDiff;
+    }
+
+    return String(right.last_seen_at || "").localeCompare(String(left.last_seen_at || ""));
+  });
+
+  return json({
+    total: candidates.length,
+    items: candidates.slice(0, limit),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -269,6 +380,11 @@ export default {
     // GET /api/trending
     if (method === "GET" && pathname === "/api/trending") {
       return handleTrending(url, env);
+    }
+
+    // GET /api/discovered
+    if (method === "GET" && pathname === "/api/discovered") {
+      return handleDiscovered(url, env);
     }
 
     return json({ error: "not_found" }, 404);

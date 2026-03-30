@@ -1,6 +1,6 @@
 # bananahub-api
 
-Cloudflare Worker for BananaHub install count tracking.
+Cloudflare Worker for BananaHub install count tracking and discovered-template intake.
 
 ## Endpoints
 
@@ -12,10 +12,14 @@ Record a template install event.
 {
   "repo": "user/repo",
   "template_id": "cyberpunk-city",
+  "template_path": "references/templates/cyberpunk-city",
+  "install_target": "user/repo/cyberpunk-city",
   "cli_version": "0.1.0",
   "timestamp": "2026-03-25T12:00:00Z"
 }
 ```
+
+Besides incrementing install counters, this endpoint also upserts a discovered-template candidate keyed by `repo + template_id`.
 
 Rate limited to 10 writes/min per IP. Returns `{ "ok": true }` on success or 429 when rate limited.
 
@@ -41,6 +45,16 @@ Get trending templates.
 
 Returns `{ "period": "24h", "templates": [...] }`.
 
+### GET /api/discovered
+
+List discovered template candidates inferred from real install events.
+
+| Parameter | Default | Description                     |
+|-----------|---------|----------------------------------|
+| `limit`   | `200`   | Max results (1-1000)             |
+
+Returns `{ "total": N, "items": [...] }`.
+
 ## KV Key Schema
 
 Namespace binding: `INSTALLS`
@@ -50,6 +64,7 @@ Namespace binding: `INSTALLS`
 | `count:{repo}:{template_id}`               | Per-template total   | none    |
 | `repo-count:{repo}`                        | Repo aggregate       | none    |
 | `daily:{YYYY-MM-DD}:{repo}:{template_id}`  | Trending data        | 7 days  |
+| `discovered:{repo}:{template_id}`          | Discovered metadata  | none    |
 | `ratelimit:{ip}:{minute}`                  | Rate limit counter   | 120s    |
 
 ## Development
